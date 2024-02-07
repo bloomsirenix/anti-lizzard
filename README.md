@@ -5,4 +5,4 @@ tinyblackhole.bat (windows)
 tinyblackhole.sh (linux) 
 
 #### these block most botnets if you want to be 100% sure you may run the _danger ones note these MIGHT block your web access like there that strong
-# note to update the repo when you can I add on the fly
+# note to update the repo when you can I add on the fly also THE BAT FILE REQUIRES ADMINISTRATOR TO BLACKHOLE THE IPS!
