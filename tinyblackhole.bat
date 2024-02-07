@@ -10,4 +10,4 @@ for %%i in (%IP_RANGES%) do (
     netsh advfirewall firewall add rule name="Block %%i" dir=out interface=any action=block remoteip=%%i
 )
 
-echo Firewalls configured to block specified IP ranges.
+echo Firewalls configured to block specified IP ranges using Windows Firewall.
