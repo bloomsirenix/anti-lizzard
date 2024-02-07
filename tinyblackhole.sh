@@ -9,4 +9,42 @@ for IP_RANGE in $IP_RANGES; do
     iptables -A OUTPUT -d $IP_RANGE -j DROP
 done
 
-echo "Firewalls configured to block specified IP ranges using iptables."
+# Additional IPs to block
+IPS_TO_BLOCK=(
+    101.35.56.189
+    102.220.23.35
+    104.250.50.111
+    111.229.125.161
+    113.125.180.33
+    114.132.54.160
+    120.48.122.45
+    120.89.98.71
+    121.138.128.233
+    121.4.89.191
+    14.99.254.18
+    161.132.38.125
+    175.178.120.91
+    177.43.233.9
+    180.184.51.141
+    183.98.51.177
+    201.184.43.91
+    211.168.48.165
+    31.216.62.97
+    34.86.20.159
+    36.67.197.52
+    43.134.202.235
+    43.153.213.247
+    43.153.48.160
+    43.153.57.158
+    62.234.119.96
+    65.181.73.155
+    79.104.0.82
+)
+
+# Block additional IPs using iptables
+for IP in "${IPS_TO_BLOCK[@]}"; do
+    iptables -A INPUT -s "$IP" -j DROP
+    iptables -A OUTPUT -d "$IP" -j DROP
+done
+
+echo "Firewalls configured to block specified IP ranges and individual IPs using iptables."
