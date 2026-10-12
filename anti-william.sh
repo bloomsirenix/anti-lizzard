@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Script to deny and drop IPs using UFW, with geolocation check
+# Script to deny and drop IPs using UFW (or iptables as fallback), with geolocation check
 # Logs actions to a file and notes Virginia, USA IPs
 
 # Log file for actions
@@ -40,33 +40,68 @@ IP_LIST=(
     "198.235.24.244"
 )
 
-# Check if script is run with sudo
-if [ "$EUID" -ne 0 ]; then
-    echo "This script must be run as root (use sudo)."
+# Re-exec as root if needed
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    if command -v sudo >/dev/null 2>&1; then
+        exec sudo bash "$0" "$@"
+    fi
+    echo "This script must be run as root (use sudo)." >&2
     exit 1
 fi
 
-# Check if ufw is installed
-if ! command -v ufw &> /dev/null; then
-    echo "UFW is not installed. Please install it first."
-    exit 1
-fi
+# Install a package using whatever package manager exists
+pkg_install() {
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq && apt-get install -y "$@"
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y "$@"
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y "$@"
+    elif command -v zypper >/dev/null 2>&1; then
+        zypper --non-interactive install "$@"
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -Sy --noconfirm "$@"
+    elif command -v apk >/dev/null 2>&1; then
+        apk add "$@"
+    else
+        return 1
+    fi
+}
 
-# Check if curl is installed
-if ! command -v curl &> /dev/null; then
-    echo "curl is not installed. Please install it first."
+ensure_cmd() {
+    # ensure_cmd <command> <package>
+    command -v "$1" >/dev/null 2>&1 && return 0
+    echo "$1 not found, attempting to install $2..."
+    pkg_install "$2" && command -v "$1" >/dev/null 2>&1
+}
+
+ensure_cmd curl curl || { echo "Error: curl is required." >&2; exit 1; }
+ensure_cmd jq jq || { echo "Error: jq is required." >&2; exit 1; }
+
+# Pick a firewall backend: ufw where available (Debian/Ubuntu), else iptables
+BACKEND=""
+if command -v ufw >/dev/null 2>&1; then
+    BACKEND="ufw"
+elif ensure_cmd ufw ufw; then
+    BACKEND="ufw"
+elif command -v iptables >/dev/null 2>&1 || ensure_cmd iptables iptables; then
+    BACKEND="iptables"
+    echo "ufw unavailable; using iptables backend."
+else
+    echo "Error: no firewall backend (ufw or iptables) available." >&2
     exit 1
 fi
 
 # Ensure log file exists
 touch "$LOG_FILE" || {
-    echo "Cannot write to log file $LOG_FILE. Check permissions."
+    echo "Cannot write to log file $LOG_FILE. Check permissions." >&2
     exit 1
 }
 
 # Function to log messages
 log_message() {
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     echo "[$timestamp] $1" >> "$LOG_FILE"
 }
 
@@ -89,36 +124,51 @@ get_geolocation() {
         echo "Unknown (API request failed)"
         return 1
     fi
-    local status=$(echo "$response" | jq -r '.status')
+    local status
+    status=$(echo "$response" | jq -r '.status')
     if [ "$status" != "success" ]; then
         echo "Unknown (API response invalid)"
         return 1
     fi
-    local country=$(echo "$response" | jq -r '.country')
-    local region=$(echo "$response" | jq -r '.regionName')
-    local city=$(echo "$response" | jq -r '.city')
+    local country region city
+    country=$(echo "$response" | jq -r '.country')
+    region=$(echo "$response" | jq -r '.regionName')
+    city=$(echo "$response" | jq -r '.city')
     echo "$city, $region, $country"
     return 0
 }
 
-# Function to block IP with UFW
+# Function to block IP
 block_ip() {
     local ip=$1
-    # Check if IP is already blocked
-    if ufw status | grep -q "$ip"; then
-        log_message "IP $ip is already blocked."
-        echo "IP $ip is already blocked."
-        return 0
-    fi
-    # Deny incoming from IP
-    ufw deny from "$ip" to any
-    if [ $? -eq 0 ]; then
-        log_message "Blocked IP $ip with UFW."
-        echo "Blocked IP $ip."
+    if [ "$BACKEND" = "ufw" ]; then
+        if ufw status | grep -q "$ip"; then
+            log_message "IP $ip is already blocked."
+            echo "IP $ip is already blocked."
+            return 0
+        fi
+        if ufw deny from "$ip" to any; then
+            log_message "Blocked IP $ip with UFW."
+            echo "Blocked IP $ip."
+        else
+            log_message "Failed to block IP $ip with UFW."
+            echo "Failed to block IP $ip."
+            return 1
+        fi
     else
-        log_message "Failed to block IP $ip with UFW."
-        echo "Failed to block IP $ip."
-        return 1
+        if iptables -w -C INPUT -s "$ip" -j DROP 2>/dev/null; then
+            log_message "IP $ip is already blocked."
+            echo "IP $ip is already blocked."
+            return 0
+        fi
+        if iptables -w -A INPUT -s "$ip" -j DROP && iptables -w -A OUTPUT -d "$ip" -j DROP; then
+            log_message "Blocked IP $ip with iptables."
+            echo "Blocked IP $ip."
+        else
+            log_message "Failed to block IP $ip with iptables."
+            echo "Failed to block IP $ip."
+            return 1
+        fi
     fi
 }
 
@@ -153,9 +203,11 @@ for ip in "${IP_LIST[@]}"; do
     sleep 2
 done
 
-# Reload UFW to ensure rules are applied
-ufw reload
-log_message "UFW rules reloaded."
-echo "UFW rules reloaded."
+# Reload firewall to ensure rules are applied
+if [ "$BACKEND" = "ufw" ]; then
+    ufw reload
+    log_message "UFW rules reloaded."
+    echo "UFW rules reloaded."
+fi
 
 echo "Processing complete. Check $LOG_FILE for details."

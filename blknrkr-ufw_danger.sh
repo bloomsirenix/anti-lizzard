@@ -1,3 +1,58 @@
+#!/usr/bin/env bash
+# blknrkr-ufw_danger.sh - block all of North Korea (and related ranges) via ufw.
+# DANGER: installs ~10k rules. If ufw is unavailable, falls back to iptables
+# through the ufw() shim below, so it also works on non-Ubuntu distros.
+
+# Re-exec as root if needed
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    if command -v sudo >/dev/null 2>&1; then
+        exec sudo bash "$0" "$@"
+    fi
+    echo "This script must be run as root (use sudo)." >&2
+    exit 1
+fi
+
+pkg_install() {
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq && apt-get install -y "$@"
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y "$@"
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y "$@"
+    elif command -v zypper >/dev/null 2>&1; then
+        zypper --non-interactive install "$@"
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -Sy --noconfirm "$@"
+    elif command -v apk >/dev/null 2>&1; then
+        apk add "$@"
+    else
+        return 1
+    fi
+}
+
+if ! command -v ufw >/dev/null 2>&1; then
+    pkg_install ufw >/dev/null 2>&1 || true
+fi
+
+if ! command -v ufw >/dev/null 2>&1; then
+    # ufw shim: translates "ufw deny from <cidr>" lines into iptables rules
+    if ! command -v iptables >/dev/null 2>&1; then
+        pkg_install iptables || { echo "Error: need ufw or iptables." >&2; exit 1; }
+    fi
+    echo "ufw not available; using iptables shim."
+    ufw() {
+        # expected call: ufw deny from <cidr>
+        if [ "$1" = "deny" ] && [ "$2" = "from" ]; then
+            local cidr="$3"
+            iptables -w -C INPUT -s "$cidr" -j DROP 2>/dev/null ||
+                iptables -w -A INPUT -s "$cidr" -j DROP
+        else
+            echo "shim: unsupported ufw args: $*" >&2
+            return 1
+        fi
+    }
+fi
+
 ufw deny from 5.62.56.160/32
 ufw deny from 5.62.56.161/32
 ufw deny from 5.62.56.162/32
