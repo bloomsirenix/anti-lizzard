@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # harden.sh - general-purpose inbound hardening via iptables.
-# Appends a HARDEN chain to INPUT; does NOT change default policies,
-# so it cannot lock you out. Safe to re-run (idempotent).
+# Inserts a HARDEN chain at the TOP of INPUT so its drops run before ufw
+# or any other accept rules; does NOT change default policies, so it
+# cannot lock you out. Safe to re-run (idempotent), and safely upgrades
+# the old appended-at-the-bottom format.
+#
+# ufw can't express these rules (conntrack/recent/hashlimit), so when ufw
+# is installed a hook is added to /etc/ufw/after.init to re-apply them
+# after 'ufw reload', 'ufw enable' and at boot.
 #
 # Usage:
 #   ./harden.sh            install/refresh firewall rules
@@ -14,6 +20,9 @@ set -u
 
 CHAIN="HARDEN"
 SYSCTL_FILE="/etc/sysctl.d/99-anti-lizzard.conf"
+AFTER_INIT="/etc/ufw/after.init"
+MARK_BEGIN="# >>> harden.sh >>>"
+MARK_END="# <<< harden.sh <<<"
 
 # Re-exec as root if needed
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
@@ -47,12 +56,43 @@ if ! command -v iptables >/dev/null 2>&1; then
 fi
 
 IPT="iptables -w"
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+
+# remove every jump from INPUT into $CHAIN (cleans up the old appended
+# format as well as any duplicates)
+unhook() {
+    while $IPT -C INPUT -j "$CHAIN" 2>/dev/null; do
+        $IPT -D INPUT -j "$CHAIN"
+    done
+}
+
+hook_ufw() {
+    [ "${HARDEN_NO_HOOK:-0}" = "1" ] && return 0
+    command -v ufw >/dev/null 2>&1 || return 0
+    if [ ! -e "$AFTER_INIT" ]; then
+        printf '#!/bin/sh\n' > "$AFTER_INIT" 2>/dev/null || {
+            echo "Warning: cannot write $AFTER_INIT; rules won't survive 'ufw reload'." >&2
+            return 0
+        }
+    fi
+    chmod +x "$AFTER_INIT" 2>/dev/null
+    grep -qF "$MARK_BEGIN" "$AFTER_INIT" 2>/dev/null && return 0
+    printf '%s\nHARDEN_NO_HOOK=1 "%s" >/dev/null 2>&1 || true\n%s\n' \
+        "$MARK_BEGIN" "$SCRIPT_PATH" "$MARK_END" >> "$AFTER_INIT"
+    echo "ufw detected: re-apply hook added to $AFTER_INIT"
+}
+
+unhook_ufw() {
+    [ -f "$AFTER_INIT" ] || return 0
+    sed -i '/>>> harden\.sh >>>/,/<<< harden\.sh <<</d' "$AFTER_INIT" 2>/dev/null
+}
 
 # ---------------------------------------------------------------- remove mode
 if [ "${1:-}" = "--remove" ] || [ "${1:-}" = "--flush" ]; then
-    $IPT -D INPUT -j "$CHAIN" 2>/dev/null
+    unhook
     $IPT -F "$CHAIN" 2>/dev/null
     $IPT -X "$CHAIN" 2>/dev/null
+    unhook_ufw
     echo "$CHAIN rules removed."
     echo "Note: $SYSCTL_FILE (if installed) is left in place - remove it"
     echo "and run 'sysctl --system' to revert kernel hardening."
@@ -61,17 +101,26 @@ fi
 
 # ---------------------------------------------------------------- firewall rules
 $IPT -N "$CHAIN" 2>/dev/null || $IPT -F "$CHAIN"
-$IPT -C INPUT -j "$CHAIN" 2>/dev/null || $IPT -A INPUT -j "$CHAIN"
+# (re)insert at position 1: drops must run before ufw and other accept
+# rules, and this transparently migrates the old appended format
+unhook
+$IPT -I INPUT 1 -j "$CHAIN"
 
 # loopback is trusted
 $IPT -A "$CHAIN" -i lo -j RETURN
+# local/private sources are never hardened against
+# (127.0.0.0/8 intentionally absent - loopback-only, still a martian off lo)
+for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10; do
+    $IPT -A "$CHAIN" -s "$net" -j RETURN
+done
 # fast-path for traffic already part of a legit session
 $IPT -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
 # garbage
 $IPT -A "$CHAIN" -m conntrack --ctstate INVALID -j DROP
 
 # martian / spoofed sources that can never be legit on a real interface
-for net in 0.0.0.0/8 127.0.0.0/8 169.254.0.0/16 224.0.0.0/4 240.0.0.0/5; do
+# (169.254.0.0/16 intentionally absent - link-local is legit LAN traffic)
+for net in 0.0.0.0/8 127.0.0.0/8 224.0.0.0/4 240.0.0.0/5; do
     $IPT -A "$CHAIN" ! -i lo -s "$net" -j DROP
 done
 
@@ -95,6 +144,8 @@ $IPT -A "$CHAIN" -p icmp --icmp-type echo-request \
     -m hashlimit --hashlimit-above 5/second --hashlimit-burst 10 \
     --hashlimit-mode srcip --hashlimit-name pingflood \
     --hashlimit-htable-expire 300000 -j DROP
+
+hook_ufw
 
 echo "$CHAIN rules installed."
 
